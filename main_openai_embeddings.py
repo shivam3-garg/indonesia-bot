@@ -283,13 +283,13 @@ ANSWER:"""
         try:
             print("🤖 Attempting answer generation with OpenAI...")
             response = self.openai_client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.1,
-                max_tokens=1500
+                max_tokens=800
             )
             print("✅ OpenAI answer generation successful")
             return response.choices[0].message.content
