@@ -75,7 +75,7 @@ class QRISRAGSystem:
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable is required")
 
-        self.openai_client = OpenAI()
+        self.openai_client = OpenAI(api_key=api_key)
         self.documents_dir = Path("documents")
         self.embeddings_dir = Path("embeddings")
         
