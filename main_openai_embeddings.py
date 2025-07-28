@@ -83,7 +83,7 @@ class QRISRAGSystem:
         gemini_key = os.getenv("GEMINI_API_KEY")
         if gemini_key:
             genai.configure(api_key=gemini_key)
-            self.gemini_client = genai.GenerativeModel('gemini-pro')
+            self.gemini_client = genai.GenerativeModel('gemini-1.5-flash')
             self.gemini_available = True
             print("✅ Gemini fallback initialized")
         else:
