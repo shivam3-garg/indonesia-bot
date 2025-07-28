@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 import faiss
 import PyPDF2
 from openai import OpenAI
+import google.generativeai as genai  # Added for Gemini fallback
 
 # Load environment variables
 load_dotenv()
@@ -34,7 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models
+# Pydantic models (keep all your existing models)
 class QueryRequest(BaseModel):
     question: str = Field(..., description="Question to ask about QRIS documents")
     debug: bool = Field(False, description="Enable debug mode")
@@ -67,15 +68,29 @@ class HealthResponse(BaseModel):
     service: str
     chunks_loaded: int
     embeddings_available: bool
+    gemini_available: bool  # Added Gemini status
 
-# QRIS RAG System (embedded in main file)
+# Enhanced QRIS RAG System with Gemini Fallback
 class QRISRAGSystem:
     def __init__(self):
+        # Initialize OpenAI client (primary)
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable is required")
-
         self.openai_client = OpenAI(api_key=api_key)
+
+        # Initialize Gemini client (fallback)
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if gemini_key:
+            genai.configure(api_key=gemini_key)
+            self.gemini_client = genai.GenerativeModel('gemini-pro')
+            self.gemini_available = True
+            print("✅ Gemini fallback initialized")
+        else:
+            self.gemini_client = None
+            self.gemini_available = False
+            print("⚠️ GEMINI_API_KEY not found. Gemini fallback unavailable.")
+
         self.documents_dir = Path("documents")
         self.embeddings_dir = Path("embeddings")
         
@@ -117,6 +132,7 @@ class QRISRAGSystem:
 
     def retrieve_relevant_chunks(self, query: str) -> List[Tuple[str, Dict, float]]:
         try:
+            # Try OpenAI embeddings first
             response = self.openai_client.embeddings.create(
                 model=self.EMBEDDING_MODEL, 
                 input=[query]
@@ -128,7 +144,7 @@ class QRISRAGSystem:
             
             results = [(self.chunks[i], self.chunk_metadata[i], float(d)) for i, d in zip(indices[0], distances[0])]
             
-            # Enhanced query-specific prioritization
+            # Enhanced query-specific prioritization (keep your existing logic)
             query_upper = query.upper()
             
             if 'PAYMENT CREDIT API' in query_upper or 'PAYMENT CREDIT' in query_upper:
@@ -161,25 +177,57 @@ class QRISRAGSystem:
                 results = api_chunks + other_table_chunks + non_table_chunks
             
             return results[:self.TOP_K_RESULTS]
+            
         except Exception as e:
-            print(f"❌ Retrieval error: {e}")
-            return []
-
-    def create_context(self, chunks: List[Tuple[str, Dict, float]]) -> str:
-        context, total = [], 0
-        for text, meta, distance in chunks:
-            table_types = meta.get('table_types', [])
-            table_info = f" [CONTAINS: {', '.join(table_types).upper()} TABLE]" if table_types else (" [CONTAINS TABULAR DATA]" if meta.get('contains_table', False) else "")
+            error_str = str(e).lower()
             
-            section = f"\n--- Document: {meta['filename']} (Chunk {meta['chunk_id']}, Relevance Score: {distance:.3f}){table_info} ---\n{text}"
-            
-            if total + len(section) > self.MAX_CONTEXT_LENGTH:
-                break
-            context.append(section)
-            total += len(section)
-        return "\n".join(context)
+            # Check if it's a quota/rate limit error
+            if any(keyword in error_str for keyword in ['quota', 'rate limit', 'insufficient_quota', '429', 'exceeded']):
+                print(f"⚠️ OpenAI quota/rate limit exceeded for embeddings: {e}")
+                print("🔄 Falling back to keyword search...")
+                
+                # Fallback to keyword search when embeddings fail
+                return self.keyword_search_fallback(query)
+            else:
+                print(f"❌ Retrieval error: {e}")
+                return []
 
-    def generate_answer(self, query: str, context: str) -> str:
+    def keyword_search_fallback(self, query: str) -> List[Tuple[str, Dict, float]]:
+        """Fallback to keyword search when embeddings fail"""
+        # Extract keywords from query
+        query_words = query.upper().replace('?', '').replace(',', '').split()
+        
+        # Filter out common words
+        stop_words = {'WHAT', 'IS', 'ARE', 'THE', 'HOW', 'DO', 'DOES', 'CAN', 'WILL', 'FOR', 'OF', 'IN', 'ON', 'AT', 'TO', 'A', 'AN', 'AND', 'OR'}
+        keywords = [word for word in query_words if word not in stop_words and len(word) > 2]
+        
+        # Score chunks based on keyword matches
+        scored_chunks = []
+        for i, chunk in enumerate(self.chunks):
+            chunk_upper = chunk.upper()
+            score = 0
+            
+            # Calculate relevance score based on keyword frequency
+            for keyword in keywords:
+                if keyword in chunk_upper:
+                    # Give higher score for exact matches
+                    score += chunk_upper.count(keyword) * 2
+                    
+                    # Bonus for table data containing the keyword
+                    if '[TABLE_DATA]' in chunk and keyword in chunk_upper:
+                        score += 5
+            
+            if score > 0:
+                # Convert to distance (lower is better for consistency with FAISS)
+                distance = 1.0 / (1.0 + score)
+                scored_chunks.append((chunk, self.chunk_metadata[i], distance))
+        
+        # Sort by relevance (lowest distance first) and return top results
+        scored_chunks.sort(key=lambda x: x[2])
+        return scored_chunks[:self.TOP_K_RESULTS]
+
+    def generate_answer_with_fallback(self, query: str, context: str) -> str:
+        """Generate answer with OpenAI primary and Gemini fallback"""
         system_prompt = """You are an expert assistant for Indonesia QRIS (Quick Response Code Indonesian Standard) international acquiring system. 
 
 Your role is to answer questions ONLY based on the provided document context. Follow these rules:
@@ -231,7 +279,9 @@ INSTRUCTIONS:
 
 ANSWER:"""
 
+        # Try OpenAI first
         try:
+            print("🤖 Attempting answer generation with OpenAI...")
             response = self.openai_client.chat.completions.create(
                 model="gpt-4",
                 messages=[
@@ -241,9 +291,55 @@ ANSWER:"""
                 temperature=0.1,
                 max_tokens=1500
             )
+            print("✅ OpenAI answer generation successful")
             return response.choices[0].message.content
+            
         except Exception as e:
-            return f"❌ GPT-4 error: {e}"
+            error_str = str(e).lower()
+            
+            # Check if it's a quota/rate limit error
+            if any(keyword in error_str for keyword in ['quota', 'rate limit', 'insufficient_quota', '429', 'exceeded']):
+                print(f"⚠️ OpenAI quota/rate limit exceeded for chat: {e}")
+                
+                # Try Gemini fallback
+                if self.gemini_available:
+                    try:
+                        print("🔄 Falling back to Gemini for answer generation...")
+                        # Combine prompts for Gemini
+                        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+                        
+                        response = self.gemini_client.generate_content(
+                            full_prompt,
+                            generation_config=genai.types.GenerationConfig(
+                                temperature=0.1,
+                                max_output_tokens=1500
+                            )
+                        )
+                        print("✅ Gemini fallback answer generation successful")
+                        return response.text
+                        
+                    except Exception as gemini_error:
+                        print(f"❌ Gemini fallback also failed: {gemini_error}")
+                        return f"❌ Both OpenAI and Gemini failed. OpenAI: {e}, Gemini: {gemini_error}"
+                else:
+                    return f"❌ OpenAI quota exceeded and Gemini fallback not available: {e}"
+            else:
+                print(f"❌ OpenAI error (not quota-related): {e}")
+                return f"❌ Error generating answer: {e}"
+
+    def create_context(self, chunks: List[Tuple[str, Dict, float]]) -> str:
+        context, total = [], 0
+        for text, meta, distance in chunks:
+            table_types = meta.get('table_types', [])
+            table_info = f" [CONTAINS: {', '.join(table_types).upper()} TABLE]" if table_types else (" [CONTAINS TABULAR DATA]" if meta.get('contains_table', False) else "")
+            
+            section = f"\n--- Document: {meta['filename']} (Chunk {meta['chunk_id']}, Relevance Score: {distance:.3f}){table_info} ---\n{text}"
+            
+            if total + len(section) > self.MAX_CONTEXT_LENGTH:
+                break
+            context.append(section)
+            total += len(section)
+        return "\n".join(context)
 
     def search_chunks_by_keyword(self, keyword: str) -> List[Tuple[str, Dict]]:
         matching_chunks = []
@@ -265,7 +361,7 @@ ANSWER:"""
             return {"answer": "No relevant information found.", "context": "", "sources": []}
         
         context = self.create_context(chunks)
-        answer = self.generate_answer(question, context)
+        answer = self.generate_answer_with_fallback(question, context)  # Using fallback method
         sources = [{"filename": m["filename"], "chunk_id": m["chunk_id"], "relevance_score": s, 
                    "contains_table": m.get('contains_table', False), "table_types": m.get('table_types', [])}
                    for _, m, s in chunks]
@@ -279,7 +375,7 @@ ANSWER:"""
         if not chunks:
             return {"answer": "No relevant information found.", "context": "", "sources": []}
         context = self.create_context(chunks)
-        answer = self.generate_answer(question, context)
+        answer = self.generate_answer_with_fallback(question, context)  # Using fallback method
         sources = [{"filename": m["filename"], "chunk_id": m["chunk_id"], "relevance_score": s, 
                    "contains_table": m.get('contains_table', False), "table_types": m.get('table_types', [])}
                    for _, m, s in chunks]
@@ -304,7 +400,8 @@ async def health_check():
         status="healthy",
         service="QRIS RAG System",
         chunks_loaded=len(rag_system.chunks),
-        embeddings_available=rag_system.faiss_index is not None
+        embeddings_available=rag_system.faiss_index is not None,
+        gemini_available=rag_system.gemini_available  # Added Gemini status
     )
 
 @app.post("/api/query", response_model=QueryResponse)
